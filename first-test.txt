@@ -1,240 +1,257 @@
-بریم قدم‌به‌قدم و دقیق، ولی جمع‌وجور — با **standalone + lazy + feature-based**. هر بخش، کد آمادهٔ کپی‌پیست داره.
+خیلی خوب—بیایم این سرویس «آپلود/نسخه‌گذاری/اشتراک» رو با Angular طوری طراحی کنیم که **بهبودپذیر، قابل‌بازیابی، قابل نگه‌داری** و آمادهٔ رشد باشه. خلاصهٔ راه‌حل + تکه‌کدهای آماده:
 
-# ۱) راه‌اندازی ساختار feature-based با standalone و lazy
-
-پروژه را این‌طور سازمان بده:
+# معماری کلاینت (standalone + feature-based)
 
 ```
-src/app/
-  core/               # سرویس‌های singleton، interceptor، guards (providedIn:'root')
-  shared/             # UI قابل‌استفاده‌مجدد: دایرکتیو/پایپ/کامپوننت‌های کوچک (standalone)
+app/
+  core/                 # auth, http, interceptors, error, logger
+  shared/               # ui های کوچک، دایرکتیو/پایپ (standalone)
   features/
-    home/
-      home.page.ts
-    products/
-      pages/
-        product-list.page.ts
-        product-detail.page.ts
-      products.routes.ts
-    admin/
-      admin.routes.ts
-  app.component.ts
-  app.routes.ts
-  app.config.ts
-```
-
-* **core**: کد سراسری (بدون وابستگی به featureها).
-* **shared**: فقط UI، بدون state یا سرویس سنگین.
-* هر **feature** مسیرها و صفحه‌های خودش را دارد و **lazy** لود می‌شود.
-
----
-
-# ۲) تنظیم `provideRouter` و `ApplicationConfig`
-
-**main.ts**
-
-```ts
-import { bootstrapApplication } from '@angular/platform-browser';
-import { appConfig } from './app/app.config';
-import { AppComponent } from './app/app.component';
-
-bootstrapApplication(AppComponent, appConfig).catch(console.error);
-```
-
-**app.config.ts**
-
-```ts
-import { ApplicationConfig } from '@angular/core';
-import { provideRouter, withPreloading, PreloadAllModules } from '@angular/router';
-import { routes } from './app.routes';
-import { provideHttpClient, withInterceptors } from '@angular/common/http';
-
-export const appConfig: ApplicationConfig = {
-  providers: [
-    provideRouter(
-      routes,
-      withPreloading(PreloadAllModules) // یا استراتژی سفارشی
-    ),
-    provideHttpClient(
-      withInterceptors([]) // جای interceptorها در core/
-    ),
-  ],
-};
+    files/              # لیست فایل‌ها، جزئیات، نسخه‌ها
+      data-access/      # NgRx store + effects + services
+      ui/               # صفحات/کامپوننت‌ها (standalone)
+      files.routes.ts
+    share/              # نمایش/دانلود با توکن اشتراک
+  app.component.ts      # <router-outlet/>
+  app.routes.ts         # lazy برای هر feature
+  app.config.ts         # provideRouter, provideHttpClient, preloading
 ```
 
 ---
 
-# ۳) استفاده از `RouterOutlet` در `app.component`
+# 1) Recoverability (قطع ارتباط/خطاهای I/O)
 
-**app.component.ts**
+* **آپلود قطعه‌ای (chunked) + ازسرگیری (resume)**، **backoff نمایی**، **قابلیت pause/cancel**.
+* ذخیرهٔ وضعیت آپلود در **IndexedDB** تا بعد از رفرش هم برگردد.
+* صف آپلود آفلاین: درخواست‌ها در SW صف شوند و بعداً ارسال شوند (Background Sync).
 
-```ts
-import { Component } from '@angular/core';
-import { RouterOutlet } from '@angular/router';
-
-@Component({
-  selector: 'app-root',
-  standalone: true,
-  imports: [RouterOutlet],
-  template: `
-    <!-- اینجا می‌تونی یک Shell/ناوبری هم بذاری -->
-    <router-outlet></router-outlet>
-  `,
-})
-export class AppComponent {}
-```
-
----
-
-# ۴) ساخت route و component های مستقل برای هر feature
-
-**app.routes.ts** (سطح ریشه)
+### سرویس آپلود قطعه‌ای
 
 ```ts
-import { Routes } from '@angular/router';
+// core/utils/backoff.ts
+export const backoff = (max = 5, base = 500) => (errors$) =>
+  errors$.pipe(scan((i) => i + 1, 0), tap(i => { if (i > max) throw 'fail'; }),
+               delayWhen(i => timer(base * 2 ** (i - 1))));
 
-export const routes: Routes = [
-  { path: '', pathMatch: 'full', redirectTo: 'home' },
-  {
-    path: 'home',
-    // صفحهٔ standalone به صورت lazy
-    loadComponent: () => import('./features/home/home.page').then(m => m.HomePage),
-    data: { title: 'Home' },
-  },
-  {
-    path: 'products',
-    // زیرفیچر با چند صفحه → فایل routes مجزا
-    loadChildren: () => import('./features/products/products.routes')
-      .then(m => m.PRODUCTS_ROUTES),
-  },
-  {
-    path: 'admin',
-    loadChildren: () => import('./features/admin/admin.routes')
-      .then(m => m.ADMIN_ROUTES),
-  },
-  {
-    path: '**',
-    loadComponent: () => import('./features/home/home.page').then(m => m.HomePage), // یا NotFoundPage
-  },
-];
-```
+// features/files/data-access/resumable-upload.service.ts
+import { HttpClient } from '@angular/common/http';
+import { Injectable, inject } from '@angular/core';
+import { Observable, from, concatMap, map, retryWhen, finalize, Subject } from 'rxjs';
 
-**features/home/home.page.ts**
+@Injectable({ providedIn: 'root' })
+export class ResumableUploadService {
+  private http = inject(HttpClient);
 
-```ts
-import { Component } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { RouterLink } from '@angular/router';
+  upload(file: File, chunkSize = 1024 * 1024): {progress$: Observable<number>, done$: Observable<string>, cancel: () => void} {
+    const chunks = Math.ceil(file.size / chunkSize);
+    const abort = new AbortController();
+    const progress = new Subject<number>();
+    const done = new Subject<string>();
 
-@Component({
-  standalone: true,
-  selector: 'app-home',
-  imports: [CommonModule, RouterLink],
-  template: `
-    <h1>Home</h1>
-    <a routerLink="/products">Products</a>
-  `,
-})
-export class HomePage {}
-```
+    from([...Array(chunks).keys()]).pipe(
+      concatMap(i => {
+        const start = i * chunkSize;
+        const end   = Math.min(file.size, start + chunkSize);
+        const body  = file.slice(start, end);
+        const headers = { 'X-Chunk-Index': String(i), 'X-Total-Chunks': String(chunks) };
+        return this.http.post<{uploadId:string}>('/api/uploads', body, { headers, signal: abort.signal })
+          .pipe(retryWhen(backoff(4, 400)));
+      }, 1),
+      map((_r, i) => Math.round(((i + 1) / chunks) * 100)),
+      finalize(() => { progress.complete(); done.complete(); })
+    ).subscribe({
+      next: p => progress.next(p),
+      error: _ => progress.error('failed'),
+      complete: () => done.next('ok'),
+    });
 
-**features/products/products.routes.ts**
-
-```ts
-import { Routes } from '@angular/router';
-
-export const PRODUCTS_ROUTES: Routes = [
-  {
-    path: '',
-    loadComponent: () => import('./pages/product-list.page')
-      .then(m => m.ProductListPage),
-  },
-  {
-    path: ':id',
-    loadComponent: () => import('./pages/product-detail.page')
-      .then(m => m.ProductDetailPage),
-  },
-];
-```
-
-**features/products/pages/product-list.page.ts**
-
-```ts
-import { Component } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { RouterLink } from '@angular/router';
-
-@Component({
-  standalone: true,
-  imports: [CommonModule, RouterLink],
-  template: `
-    <h2>Product List</h2>
-    <ul>
-      <li *ngFor="let p of [1,2,3]">
-        <a [routerLink]="['/products', p]">Product {{p}}</a>
-      </li>
-    </ul>
-  `,
-})
-export class ProductListPage {}
-```
-
-**features/products/pages/product-detail.page.ts**
-
-```ts
-import { Component } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { ActivatedRoute, RouterLink } from '@angular/router';
-
-@Component({
-  standalone: true,
-  imports: [CommonModule, RouterLink],
-  template: `
-    <a routerLink="/products">Back</a>
-    <h3>Product Detail #{{ id }}</h3>
-  `,
-})
-export class ProductDetailPage {
-  id = Number(inject(ActivatedRoute).snapshot.paramMap.get('id'));
+    return { progress$: progress.asObservable(), done$: done.asObservable(), cancel: () => abort.abort() };
+  }
 }
 ```
 
-**(اختیاری) گارد با `canMatch` برای admin**
+> اگر سرور از **TUS/Content-Range** پشتیبانی کند، همان پروتکل را پیشنهاد می‌کنم.
+
+---
+
+# 2) Continuity (ادامهٔ کاربر بدون از دست‌دادن پیشرفت)
+
+* **Service Worker** برای کش دارایی‌ها و APIهای read-only؛
+* نگه‌داری صف آپلود و وضعیت UI در **IndexedDB** و **rehydrate** پس از رفرش.
+* هنگام آنلاین‌شدن: تلاش خودکار برای ادامهٔ آپلود.
+
+### نمونهٔ ذخیرهٔ صف در IndexedDB (خیلی کوتاه)
 
 ```ts
-// core/guards/admin.guard.ts
-import { CanMatchFn } from '@angular/router';
-import { inject } from '@angular/core';
-import { AuthService } from '../auth.service';
+// features/files/data-access/upload-queue.store.ts (ComponentStore)
+import { ComponentStore } from '@ngrx/component-store';
+import { Injectable } from '@angular/core';
+import { set, get, del } from 'idb-keyval';
 
-export const canMatchAdmin: CanMatchFn = () => {
-  const auth = inject(AuthService);
-  return auth.isAdmin() ? true : ['home']; // redirect
-};
-```
+export interface UploadTask { id:string; fileName:string; size:number; progress:number; status:'queued'|'uploading'|'done'|'error'; }
+@Injectable({ providedIn:'root' })
+export class UploadQueueStore extends ComponentStore<{tasks: UploadTask[]}> {
+  constructor(){ super({tasks: []}); this.hydrate(); }
+  readonly tasks$ = this.select(s => s.tasks);
 
-**features/admin/admin.routes.ts**
+  readonly upsert = this.updater((s, t:UploadTask) => { 
+    const i = s.tasks.findIndex(x => x.id === t.id);
+    const tasks = i<0 ? [...s.tasks, t] : s.tasks.map((x,ix)=>ix===i?t:x);
+    set('uploadQueue', tasks); 
+    return {tasks};
+  });
 
-```ts
-import { Routes } from '@angular/router';
-import { canMatchAdmin } from '../../core/guards/admin.guard';
-
-export const ADMIN_ROUTES: Routes = [
-  {
-    path: '',
-    canMatch: [canMatchAdmin],
-    loadComponent: () => import('./admin.page').then(m => m.AdminPage),
-  },
-];
+  private async hydrate(){ const tasks = (await get('uploadQueue')) ?? []; this.patchState({tasks}); }
+  clearTask = (id:string) => this.patchState(s => ({tasks: s.tasks.filter(t=>t.id!==id)}));
+}
 ```
 
 ---
 
-## نکات نگه‌داری و توسعهٔ آسان
+# 3) Maintainability (ساده‌سازی نگه‌داری)
 
-* هر فیچر یک **routes.ts** و چند **page standalone** دارد؛ importهای هر صفحه حداقلی.
-* **core** به هیچ featureی وابسته نیست؛ ولی featureها می‌توانند از **shared** استفاده کنند.
-* برای exportهای shared/feature از **barrel (index.ts)** استفاده کن.
-* اگر پروژه بزرگ شد، نام‌گذاری `*.page.ts` (صفحه) و `*.ui.ts` (کامپوننت‌های کوچک) تفاوت نقش‌ها را واضح می‌کند.
+* ساختار **feature-based**، هر فیچر: `data-access` (API+Store+Effects) و `ui`.
+* **standalone components** و **lazy routes**؛ shared فقط UI.
+* قراردادهای تایپی: **DTO**‌ها، `satisfies`، **strict** در tsconfig.
+* رفتار خطا در یک نقطه: **HttpErrorInterceptor** + توابع قابل‌استفادهٔ مجدد برای toast/alert.
 
-اگر بخوای، همین اسکلت را برای فیچرهای واقعی پروژه‌ات (مثلاً users/orders/analytics) با گارد/ریزالور/افکت‌ها سفارشی می‌کنم. فقط اسم فیچرها را بگو.
+### Interceptor خطا/ری‌تری کوتاه
+
+```ts
+// core/http/error.interceptor.ts
+import { HttpInterceptorFn } from '@angular/common/http';
+import { catchError } from 'rxjs/operators';
+import { throwError } from 'rxjs';
+
+export const errorInterceptor: HttpInterceptorFn = (req, next) =>
+  next(req).pipe(catchError(err => {
+    // mapping خطاها به پیام‌های UI یا telemetry
+    return throwError(() => err);
+  }));
+```
+
+---
+
+# 4) Authentication (امن و ساده)
+
+* **OIDC/OAuth2 PKCE** → توکن در **HttpOnly Cookie** (ترجیحی). اگر لازم شد توکن در حافظه‌ی JS، **refresh rotation** و Short-lived.
+* گاردها با **`canMatch`** و نقش‌ها در `data.roles`.
+* **Interceptor** برای الصاق اعتبارنامه و نوسازی ساکت (silent refresh).
+
+```ts
+// core/auth/auth.guard.ts
+import { CanMatchFn } from '@angular/router';
+export const requireAuth: CanMatchFn = () => /* check session */ true;
+```
+
+---
+
+# 5) State Management (فایل‌ها/نسخه‌ها + صف آپلود)
+
+* برای دامین «فایل/نسخه»: **NgRx Entity**‌ها؛ برای «صف آپلود»: **ComponentStore** (وابسته به UI).
+* **Selectors** برای ترکیب: فایل + آخرین نسخه + وضعیت آپلود.
+
+### اسکچ NgRx برای فایل‌ها
+
+```ts
+// features/files/data-access/files.state.ts
+import { createEntityAdapter, createFeature, createReducer, on, createAction, props } from '@ngrx/store';
+
+export interface FileEntity { id:string; name:string; size:number; latestVersionId?:string; }
+const adapter = createEntityAdapter<FileEntity>();
+
+export const loadFilesSuccess = createAction('[Files] load success', props<{files: FileEntity[]}>());
+
+const reducer = createReducer(adapter.getInitialState(), on(loadFilesSuccess, (s, {files}) => adapter.setAll(files, s)));
+export const filesFeature = createFeature({ name:'files', reducer });
+export const { selectAll: selectAllFiles, selectEntities: selectFileMap } = adapter.getSelectors();
+```
+
+---
+
+# 6) Client Observability (قابل مشاهده بودن رفتار کاربر/کلاینت)
+
+* **Telemetry**: ادغام با Sentry/Elastic/OTel؛ ارسال breadcrumb برای رویدادهای کاربر (شروع/پایان آپلود، لغو، خطا).
+* **Http/Router instrumentation**: اینترسپتور لاگ + گوش دادن به `NavigationEnd`.
+* اندازه‌گیری کارایی: **Web Vitals** و Performance marks.
+
+```ts
+// core/obs/telemetry.service.ts
+@Injectable({providedIn:'root'})
+export class Telemetry {
+  track(event: string, props?: Record<string, unknown>) { console.log('[track]', event, props); /* send to Sentry/OTel */ }
+}
+```
+
+---
+
+# روت‌ها و صفحات (standalone + lazy)
+
+**app.routes.ts**
+
+```ts
+export const routes: Routes = [
+  { path: '', pathMatch: 'full', redirectTo: 'files' },
+  { path: 'files', loadChildren: () => import('./features/files/files.routes').then(m => m.FILES_ROUTES) },
+  { path: 's/:token', loadChildren: () => import('./features/share/share.routes').then(m => m.SHARE_ROUTES) },
+  { path: '**', loadComponent: () => import('./shared/not-found.page').then(m=>m.NotFoundPage) }
+];
+```
+
+**features/files/files.routes.ts**
+
+```ts
+export const FILES_ROUTES: Routes = [
+  { path: '', loadComponent: () => import('./ui/files-list.page').then(m => m.FilesListPage) },
+  { path: ':id', loadComponent: () => import('./ui/file-detail.page').then(m => m.FileDetailPage) },
+];
+```
+
+**نمونهٔ UI: فایل‌لیست با آپلود قابل وقفه**
+
+```ts
+// features/files/ui/files-list.page.ts
+@Component({
+  standalone: true,
+  imports: [CommonModule],
+  template: `
+    <h1>Files</h1>
+    <input type="file" (change)="pick($event)" />
+    <ul>
+      <li *ngFor="let t of queue.tasks$ | async">
+        {{t.fileName}} — {{t.progress}}% — {{t.status}}
+        <button (click)="cancel(t.id)">لغو</button>
+      </li>
+    </ul>
+  `
+})
+export class FilesListPage {
+  constructor(public queue: UploadQueueStore, private up: ResumableUploadService, private tel: Telemetry) {}
+  pick(ev: Event) {
+    const f = (ev.target as HTMLInputElement).files?.[0]; if(!f) return;
+    const id = crypto.randomUUID();
+    this.queue.upsert({ id, fileName: f.name, size: f.size, progress: 0, status: 'queued' });
+    const task = this.up.upload(f);
+    this.tel.track('upload_started', { id, name: f.name, size: f.size });
+    task.progress$.subscribe(p => this.queue.upsert({ id, fileName:f.name, size:f.size, progress:p, status:'uploading' }));
+    task.done$.subscribe({
+      next: _ => { this.queue.upsert({ id, fileName:f.name, size:f.size, progress:100, status:'done' }); this.tel.track('upload_done',{id}); },
+      error: _ => this.queue.upsert({ id, fileName:f.name, size:f.size, progress:0, status:'error' })
+    });
+  }
+  cancel(id: string) { /* نگه‌داری reference سرویس برای abort، یا status='error' */ }
+}
+```
+
+---
+
+## جمع‌بندی
+
+* **Recoverability**: chunked + resume + backoff + صف آفلاین.
+* **Continuity**: IndexedDB + SW + rehydrate.
+* **Maintainability**: feature-based + standalone + interceptorهای مشترک.
+* **Authentication**: OIDC + canMatch + Interceptor.
+* **State Management**: NgRx Entity برای دامین، ComponentStore برای صف.
+* **Observability**: telemetry + لاگ شبکه/مسیریابی + Web Vitals.
+
+اگر خواستی، می‌تونم همین اسکلت رو به یک ریپو پایه (Angular 17+) تبدیل کنم و فایل‌های آمادهٔ پروژه رو برات بسازم؛ یا یکی از بخش‌ها (مثلاً «ازسرگیری آپلود») رو کامل‌تر و تست‌پذیر پیاده کنم.

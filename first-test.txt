@@ -1,2 +1,240 @@
-i am ready niloofar
+بریم قدم‌به‌قدم و دقیق، ولی جمع‌وجور — با **standalone + lazy + feature-based**. هر بخش، کد آمادهٔ کپی‌پیست داره.
 
+# ۱) راه‌اندازی ساختار feature-based با standalone و lazy
+
+پروژه را این‌طور سازمان بده:
+
+```
+src/app/
+  core/               # سرویس‌های singleton، interceptor، guards (providedIn:'root')
+  shared/             # UI قابل‌استفاده‌مجدد: دایرکتیو/پایپ/کامپوننت‌های کوچک (standalone)
+  features/
+    home/
+      home.page.ts
+    products/
+      pages/
+        product-list.page.ts
+        product-detail.page.ts
+      products.routes.ts
+    admin/
+      admin.routes.ts
+  app.component.ts
+  app.routes.ts
+  app.config.ts
+```
+
+* **core**: کد سراسری (بدون وابستگی به featureها).
+* **shared**: فقط UI، بدون state یا سرویس سنگین.
+* هر **feature** مسیرها و صفحه‌های خودش را دارد و **lazy** لود می‌شود.
+
+---
+
+# ۲) تنظیم `provideRouter` و `ApplicationConfig`
+
+**main.ts**
+
+```ts
+import { bootstrapApplication } from '@angular/platform-browser';
+import { appConfig } from './app/app.config';
+import { AppComponent } from './app/app.component';
+
+bootstrapApplication(AppComponent, appConfig).catch(console.error);
+```
+
+**app.config.ts**
+
+```ts
+import { ApplicationConfig } from '@angular/core';
+import { provideRouter, withPreloading, PreloadAllModules } from '@angular/router';
+import { routes } from './app.routes';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideRouter(
+      routes,
+      withPreloading(PreloadAllModules) // یا استراتژی سفارشی
+    ),
+    provideHttpClient(
+      withInterceptors([]) // جای interceptorها در core/
+    ),
+  ],
+};
+```
+
+---
+
+# ۳) استفاده از `RouterOutlet` در `app.component`
+
+**app.component.ts**
+
+```ts
+import { Component } from '@angular/core';
+import { RouterOutlet } from '@angular/router';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [RouterOutlet],
+  template: `
+    <!-- اینجا می‌تونی یک Shell/ناوبری هم بذاری -->
+    <router-outlet></router-outlet>
+  `,
+})
+export class AppComponent {}
+```
+
+---
+
+# ۴) ساخت route و component های مستقل برای هر feature
+
+**app.routes.ts** (سطح ریشه)
+
+```ts
+import { Routes } from '@angular/router';
+
+export const routes: Routes = [
+  { path: '', pathMatch: 'full', redirectTo: 'home' },
+  {
+    path: 'home',
+    // صفحهٔ standalone به صورت lazy
+    loadComponent: () => import('./features/home/home.page').then(m => m.HomePage),
+    data: { title: 'Home' },
+  },
+  {
+    path: 'products',
+    // زیرفیچر با چند صفحه → فایل routes مجزا
+    loadChildren: () => import('./features/products/products.routes')
+      .then(m => m.PRODUCTS_ROUTES),
+  },
+  {
+    path: 'admin',
+    loadChildren: () => import('./features/admin/admin.routes')
+      .then(m => m.ADMIN_ROUTES),
+  },
+  {
+    path: '**',
+    loadComponent: () => import('./features/home/home.page').then(m => m.HomePage), // یا NotFoundPage
+  },
+];
+```
+
+**features/home/home.page.ts**
+
+```ts
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { RouterLink } from '@angular/router';
+
+@Component({
+  standalone: true,
+  selector: 'app-home',
+  imports: [CommonModule, RouterLink],
+  template: `
+    <h1>Home</h1>
+    <a routerLink="/products">Products</a>
+  `,
+})
+export class HomePage {}
+```
+
+**features/products/products.routes.ts**
+
+```ts
+import { Routes } from '@angular/router';
+
+export const PRODUCTS_ROUTES: Routes = [
+  {
+    path: '',
+    loadComponent: () => import('./pages/product-list.page')
+      .then(m => m.ProductListPage),
+  },
+  {
+    path: ':id',
+    loadComponent: () => import('./pages/product-detail.page')
+      .then(m => m.ProductDetailPage),
+  },
+];
+```
+
+**features/products/pages/product-list.page.ts**
+
+```ts
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { RouterLink } from '@angular/router';
+
+@Component({
+  standalone: true,
+  imports: [CommonModule, RouterLink],
+  template: `
+    <h2>Product List</h2>
+    <ul>
+      <li *ngFor="let p of [1,2,3]">
+        <a [routerLink]="['/products', p]">Product {{p}}</a>
+      </li>
+    </ul>
+  `,
+})
+export class ProductListPage {}
+```
+
+**features/products/pages/product-detail.page.ts**
+
+```ts
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ActivatedRoute, RouterLink } from '@angular/router';
+
+@Component({
+  standalone: true,
+  imports: [CommonModule, RouterLink],
+  template: `
+    <a routerLink="/products">Back</a>
+    <h3>Product Detail #{{ id }}</h3>
+  `,
+})
+export class ProductDetailPage {
+  id = Number(inject(ActivatedRoute).snapshot.paramMap.get('id'));
+}
+```
+
+**(اختیاری) گارد با `canMatch` برای admin**
+
+```ts
+// core/guards/admin.guard.ts
+import { CanMatchFn } from '@angular/router';
+import { inject } from '@angular/core';
+import { AuthService } from '../auth.service';
+
+export const canMatchAdmin: CanMatchFn = () => {
+  const auth = inject(AuthService);
+  return auth.isAdmin() ? true : ['home']; // redirect
+};
+```
+
+**features/admin/admin.routes.ts**
+
+```ts
+import { Routes } from '@angular/router';
+import { canMatchAdmin } from '../../core/guards/admin.guard';
+
+export const ADMIN_ROUTES: Routes = [
+  {
+    path: '',
+    canMatch: [canMatchAdmin],
+    loadComponent: () => import('./admin.page').then(m => m.AdminPage),
+  },
+];
+```
+
+---
+
+## نکات نگه‌داری و توسعهٔ آسان
+
+* هر فیچر یک **routes.ts** و چند **page standalone** دارد؛ importهای هر صفحه حداقلی.
+* **core** به هیچ featureی وابسته نیست؛ ولی featureها می‌توانند از **shared** استفاده کنند.
+* برای exportهای shared/feature از **barrel (index.ts)** استفاده کن.
+* اگر پروژه بزرگ شد، نام‌گذاری `*.page.ts` (صفحه) و `*.ui.ts` (کامپوننت‌های کوچک) تفاوت نقش‌ها را واضح می‌کند.
+
+اگر بخوای، همین اسکلت را برای فیچرهای واقعی پروژه‌ات (مثلاً users/orders/analytics) با گارد/ریزالور/افکت‌ها سفارشی می‌کنم. فقط اسم فیچرها را بگو.

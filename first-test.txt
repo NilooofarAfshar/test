@@ -1147,7 +1147,447 @@
 
 
 
+┌─────────────────────────────────────────────┐
+│              کاربر (مرورگر)                 │
+│  - آپلود / دانلود / اشتراک‌گذاری           │
+└─────────────────┬───────────────────────────┘
+                  │ (HTTP/HTTPS)
+┌─────────────────▼───────────────────────────┐
+│         سرویس ابری مدیریت فایل              │
+│  (File Cloud Service)                       │
+│  - ذخیره فایل‌ها                           │
+│  - مدیریت نسخه‌ها                          │
+│  - تولید لینک اشتراک                       │
+│  - ادامه آپلود پس از قطعی                  │
+└─────────────────────────────────────────────┘
 
+
+------------------------------------------------------
+
+
+┌─────────────────────────────────────────────────────┐
+│                   Frontend (React)                  │
+│  - مدیریت state پیچیده (آپلود، خطا، وضعیت لینک)   │
+│  - ذخیره محلی (LocalStorage) برای Resume           │
+└────────────────────┬────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────┐
+│              API Gateway (Node.js/Express)         │
+│  - احراز هویت                                     │
+│  - هدایت درخواست‌ها                               │
+│  - تولید Upload-ID برای هر آپلود                  │
+└─────┬───────────────────────┬──────────────────────┘
+      │                       │
+┌─────▼──────┐        ┌──────▼──────┐
+│  Service   │        │  Service    │
+│  Upload    │        │  Share      │
+│  (مدیریت   │        │  (لینک‌ساز) │
+│   آپلود)   │        │             │
+└─────┬──────┘        └──────┬──────┘
+      │                       │
+┌─────▼───────────────────────▼──────┐
+│         Object Storage (Minio/S3)   │
+│  - ذخیره تکه‌تکه (Chunk) فایل      │
+│  - قابلیت ادامه از نقطه قطع (Range)│
+└────────────────────────────────────┘
+
+
+----------------------------------------------
+
+
+┌─────────────────────────────────────────────────┐
+│              Upload Service                    │
+│                                                 │
+│  ┌─────────────────────────────────────────┐   │
+│  │  ChunkManager                          │   │
+│  │  - دریافت تکه‌های ۵ مگابایتی          │   │
+│  │  - بررسی Checksum هر تکه               │   │
+│  └────────────┬────────────────────────────┘   │
+│               │                                 │
+│  ┌────────────▼────────────────────────────┐   │
+│  │  ResumeHandler                         │   │
+│  │  - ذخیره آخرین تکه موفق در Redis       │   │
+│  │  - برگرداندن موقعیت به کلاینت برای    │   │
+│  │    ادامه از آن نقطه                    │   │
+│  └────────────┬────────────────────────────┘   │
+│               │                                 │
+│  ┌────────────▼────────────────────────────┐   │
+│  │  VersionManager                        │   │
+│  │  - وقتی آپلود کامل شد، نسخه جدید ثبت  │   │
+│  │    می‌شود در دیتابیس (PostgreSQL)     │   │
+│  └─────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────┘
+
+-----------------------------------------------------------
+
+
+// Frontend: ارسال درخواست شروع
+const response = await fetch('/api/upload/start', {
+  method: 'POST',
+  body: JSON.stringify({ fileName: 'proje.docx', totalChunks: 20 })
+});
+const { uploadId } = await response.json();
+// ذخیره در state و localStorage برای بازیابی
+localStorage.setItem('uploadId', uploadId);
+
+
+
+
+// Frontend: ارسال هر تکه
+async function uploadChunk(chunkIndex) {
+  const formData = new FormData();
+  formData.append('chunk', chunkBlob);
+  formData.append('chunkIndex', chunkIndex);
+  
+  const res = await fetch(`/api/upload/chunk/${uploadId}`, {
+    method: 'POST',
+    body: formData
+  });
+  
+  if (!res.ok) {
+    // اگر قطعی رخ داد، بعداً از آخرین تکه موفق ادامه می‌دهیم
+    saveLastSuccessfulChunk(chunkIndex - 1);
+  }
+}
+
+
+// Frontend: بعد از بازگشت اینترنت
+const lastChunk = localStorage.getItem('lastChunk') || 0;
+for (let i = lastChunk; i < totalChunks; i++) {
+  await uploadChunk(i);
+}
+
+
+# Backend (Python/Flask) پس از کامل شدن آپلود
+def finalize_upload(upload_id):
+    # بررسی اینکه همه تکه‌ها دریافت شده
+    version_number = get_next_version(user_id, file_name)
+    save_to_database(file_name, version_number, s3_path)
+    # ایجاد لینک اشتراک (با توکن امن)
+    share_link = generate_share_link(file_id, version_number)
+    return share_link
+
+
+
+
+
+
+C4Context
+    title System Context Diagram - File Storage & Sharing Platform
+
+    Person(user, "End User", "Uploads, manages versions, and shares files.")
+    
+    System(frontend, "Frontend Web Application", "React SPA providing UI for file management, uploading, and sharing.")
+    
+    System_Ext(backend, "Backend API Gateway", "Handles auth, metadata, sharing logic, and rate limiting.")
+    System_Ext(s3, "Cloud Storage (AWS S3)", "Stores physical files and archives.")
+    System_Ext(observability, "Observability Platform", "Sentry / Datadog (Logs, RUM, Traces).")
+    System_Ext(cdn, "CDN (Cloudflare)", "Serves static assets and caches public shared links.")
+
+    Rel(user, cdn, "Requests web app from")
+    Rel(cdn, frontend, "Delivers")
+    Rel(user, frontend, "Interacts with")
+    
+    Rel(frontend, backend, "API calls (JWT, HTTPS)", "REST/GraphQL")
+    Rel(frontend, s3, "Direct multipart/chunked uploads", "TUS Protocol")
+    Rel(frontend, observability, "Sends telemetry & crash reports", "Async")
+
+
+
+C4Container
+    title Container Diagram - Frontend Architecture
+
+    Person(user, "User", "Interacts with the UI")
+
+    System_Boundary(browser, "Web Browser Ecosystem") {
+        Container(ui, "UI Components (React)", "Renders views, handles a11y, i18n, virtualization for file lists.")
+        Container(state_server, "Server State (React Query)", "Caches API responses, pessimistic/optimistic updates.")
+        Container(state_client, "Client State (Zustand)", "Manages UI states (modals, selection, theme).")
+        Container(upload_manager, "Upload Manager (TUS Client)", "Handles chunking, pause/resume, error recovery.")
+        
+        System_Boundary(storage, "Browser Storage") {
+            ContainerDb(indexeddb, "IndexedDB", "Stores offline queue, metadata cache.")
+            ContainerDb(cookie, "HttpOnly Cookies", "Stores Secure Auth Tokens (JWT).")
+        }
+        
+        Container(worker, "Service Worker (Workbox)", "Intercepts network, serves cached UI, syncs offline queues.")
+    }
+
+    Container_Ext(api, "Backend APIs", "Node.js / Go")
+    Container_Ext(sentry, "Sentry SDK", "Error Tracking")
+
+    Rel(user, ui, "Clicks, Drag & Drops")
+    Rel(ui, state_client, "Reads/Updates UI State")
+    Rel(ui, state_server, "Triggers Queries/Mutations")
+    Rel(ui, upload_manager, "Initiates Uploads")
+    
+    Rel(state_server, api, "Fetches/Mutates Data", "HTTPS")
+    Rel(upload_manager, api, "Uploads Chunks", "TUS/HTTPS")
+    
+    Rel(worker, indexeddb, "Reads/Writes offline tasks")
+    Rel(ui, cookie, "Validates Auth Session")
+    Rel(ui, sentry, "Captures Exceptions")
+
+
+
+C4Component
+    title Component Diagram - Frontend Web Application (File & Upload Modules)
+
+    Person(user, "User", "Interacts with UI")
+    Container_Ext(api, "Backend APIs", "Handles metadata & auth")
+    Container_Ext(s3, "Cloud Storage (S3)", "Receives file chunks")
+    Container_Ext(sentry, "Sentry SDK", "Error Tracking")
+
+    Container_Boundary(frontend_app, "Frontend Web Application") {
+        Component(ui_views, "File Workspace Views", "React / Tailwind", "Renders file grid, version history pane, and sharing modals. Implements virtualization for performance.")
+        
+        Component(upload_hook, "useUpload Controller (Hook)", "React Custom Hook", "Orchestrates upload states, manages optimistic UI updates, and triggers alerts.")
+        
+        Component(tus_service, "TUS Upload Service", "TypeScript / TUS Client", "Handles chunking, tracking offsets, and automatic retries upon network failure (Recoverability).")
+        
+        Component(sync_manager, "State Synchronizer", "React Query", "Manages Server-State caching, invalidates queries post-upload, and polls for background refresh.")
+        
+        Component(offline_manager, "Offline Queue Manager", "TypeScript", "Intercepts actions when offline, queues mutations, and registers background sync.")
+        
+        Component(db_adapter, "IndexedDB Adapter", "Dexie.js / LocalForage", "Persists the offline queue and meta-caches to prevent data loss on page reload.")
+        
+        Component(auth_interceptor, "Security Interceptor", "Axios Instance", "Injects JWT tokens, handles 401 automatic token refresh, and cleanses outgoing payloads.")
+    }
+
+    Rel(user, ui_views, "Uses", "UI Interactions")
+    Rel(ui_views, upload_hook, "Triggers uploads / actions")
+    Rel(ui_views, sync_manager, "Reads file/version cache")
+    
+    Rel(upload_hook, tus_service, "Delegates binary transfer")
+    Rel(upload_hook, sync_manager, "Dispatches optimistic updates")
+    
+    Rel(tus_service, s3, "Uploads chunks (TUS protocol)", "HTTPS / Binary")
+    Rel(tus_service, sentry, "Logs chunk-upload failures", "HTTPS")
+    
+    Rel(sync_manager, auth_interceptor, "Requests metadata updates")
+    Rel(auth_interceptor, api, "Executes secure HTTP calls", "HTTPS / JSON")
+    
+    Rel(sync_manager, offline_manager, "Defers mutations if offline")
+    Rel(offline_manager, db_adapter, "Saves pending queue")
+
+
+
+
+src/
+├── app/                  # Global providers, global styles, entry point
+├── pages/                # FileWorkspace page, SharePage
+├── widgets/              # FileGridWithToolbar, VersionHistorySidebar
+├── features/             # Independent user actions
+│   ├── upload-file/      # Core upload feature
+│   │   ├── model/        # Zustand slice for upload progress & React Query mutations
+│   │   ├── api/          # TUS protocol implementation & offline queue logic
+│   │   └── ui/           # UploadZone component, ProgressIndicator
+│   ├── share-file/       # Link generation, RBAC permission toggles
+│   └── manage-versions/  # Rollback actions, archival logic
+├── entities/             # Business concepts (File, User, Version)
+├── shared/               # Reusable utilities (API client, IndexedDB config, UI components)
+
+
+۲. پیاده‌سازی مدیریت آپلود و بازیابی در آنگولار (TUS + IndexedDB)
+در آنگولار، این منطق را درون یک سرفیس مبتنی بر دکوراتور @Injectable کپسوله‌سازی می‌کنیم. برای انتشار تغییرات پرفورمنس و درصد آپلود، از RxJS Subject استفاده می‌کنیم که ابزار استاندارد آنگولار برای مدیریت Streamها است.
+
+// features/upload-file/api/tus-upload.service.ts
+import { Injectable } from '@angular/core';
+import * as tus from 'tus-js-client';
+import { openDB } from 'idb';
+import { Subject } from 'rxjs';
+
+const DB_NAME = 'StorageApp_Offline_DB';
+
+export interface UploadProgress {
+  fileId: string;
+  percentage: number;
+}
+
+@Injectable({
+  providedIn: 'root'
+})
+export class TusUploadService {
+  private upload: tus.Upload | null = null;
+  
+  // استفاده از Subject برای مانیتور کردن پیشرفت آپلود در کامپوننت‌ها
+  public progress$ = new Subject<UploadProgress>();
+
+  private async saveUploadFingerprint(fileId: string, uploadUrl: string): Promise<void> {
+    const db = await openDB(DB_NAME, 1);
+    await db.put('upload_fingerprints', { fileId, uploadUrl, timestamp: Date.now() });
+  }
+
+  public async startOrResumeUpload(file: File, fileId: string): Promise<string> {
+    const db = await openDB(DB_NAME, 1, {
+      upgrade(db) {
+        if (!db.objectStoreNames.contains('upload_fingerprints')) {
+          db.createObjectStore('upload_fingerprints', { keyPath: 'fileId' });
+        }
+      },
+    });
+
+    const savedMeta = await db.get('upload_fingerprints', fileId);
+
+    return new Promise((resolve, reject) => {
+      this.upload = new tus.Upload(file, {
+        endpoint: 'https://api.storage-service.internal/v1/uploads',
+        retryDelays: [0, 3000, 5000, 10000, 20000], // الگوریتم Exponential Backoff برای Recoverability
+        uploadUrl: savedMeta ? savedMeta.uploadUrl : null,
+        chunkSize: 5 * 1024 * 1024,
+        metadata: {
+          filename: file.name,
+          filetype: file.type,
+          fileId: fileId
+        },
+        onError: (error) => {
+          this.progress$.error(error);
+          reject(error);
+        },
+        onProgress: (bytesSent, bytesTotal) => {
+          const percentage = Math.round((bytesSent / bytesTotal) * 100);
+          this.progress$.next({ fileId, percentage });
+        },
+        onChunkComplete: async (chunkSize, bytesAccepted, bytesTotal) => {
+          if (this.upload?.url) {
+            await this.saveUploadFingerprint(fileId, this.upload.url);
+          }
+        },
+        onSuccess: async () => {
+          if (this.upload?.url) {
+            const db = await openDB(DB_NAME, 1);
+            await db.delete('upload_fingerprints', fileId);
+          }
+          this.progress$.next({ fileId, percentage: 100 });
+          resolve(this.upload?.url || '');
+        }
+      });
+
+      this.upload.start();
+    });
+  }
+
+  public pause(): void {
+    if (this.upload) {
+      this.upload.abort();
+    }
+  }
+}
+
+
+۳. مدیریت وضعیت و به‌روزرسانی خوش‌بینانه (Optimistic Updates) در آنگولار
+برای مدیریت وضعیت سرور (Server-State) و اعمال آپدیت‌های خوش‌بینانه، از نسخه آنگولار کتابخانه توزیع‌شده تان‌استک یعنی @tanstack/angular-query-experimental استفاده می‌کنیم که کاملاً با سیستم جدید Signals در آنگولار هماهنگ است.
+
+در این کد، یک سرویس ایجاد می‌کنیم که متد Mutation را در اختیار کامپوننت قرار می‌دهد و ساختار داده‌های داخل کش را فوراً قبل از پاسخ سرور تغییر می‌دهد:
+// features/upload-file/model/upload-file-mutation.service.ts
+import { Injectable, inject } from '@angular/core';
+import { injectMutation, injectQueryClient } from '@tanstack/angular-query-experimental';
+import { TusUploadService } from '../api/tus-upload.service';
+import { firstValueFrom } from 'rxjs';
+
+interface UploadPayload {
+  file: File;
+  fileId: string;
+}
+
+interface FileEntity {
+  id: string;
+  name: string;
+  size: number;
+  status: 'UPLOADING' | 'SUCCESS' | 'FAILED';
+  updatedAt: string;
+  version: number;
+}
+
+@Injectable({
+  providedIn: 'root'
+})
+export class UploadFileMutationService {
+  private queryClient = injectQueryClient();
+  private tusUploadService = inject inject(TusUploadService);
+
+  // تعریف Mutation مجهز به آپدیت خوش‌بینانه برای لایه UI
+  public uploadMutation = injectMutation(() => ({
+    mutationFn: async ({ file, fileId }: UploadPayload) => {
+      // اجرای متد آپلود و بازگرداندن پرومیس نهایی
+      return this.tusUploadService.startOrResumeUpload(file, fileId);
+    },
+    
+    // ۱. مرحله اول: اعمال تغییرات به صورت کاملاً خوش‌بینانه در کش آنگولار
+    onMutate: async (newFilePayload: UploadPayload) => {
+      // لغو کوئری‌های در حال اجرا برای جلوگیری از Overwrite شدن وضعیت UI
+      await this.queryClient.cancelQueries({ queryKey: ['files'] });
+      
+      // ذخیره وضعیت قبلی برای لغو (Rollback) در صورت بروز خطا
+      const previousFiles = this.queryClient.getQueryData<FileEntity[]>(['files']);
+
+      const optimisticFile: FileEntity = {
+        id: newFilePayload.fileId,
+        name: newFilePayload.file.name,
+        size: newFilePayload.file.size,
+        status: 'UPLOADING',
+        updatedAt: new Date().toISOString(),
+        version: 1
+      };
+
+      // تزریق مستقیم فایل به ابتدای لیست فایل‌ها در فرانت‌اند
+      this.queryClient.setQueryData<FileEntity[]>(['files'], (old) => {
+        return old ? [optimisticFile, ...old] : [optimisticFile];
+      });
+
+      return { previousFiles };
+    },
+
+    // ۲. مرحله دوم: مدیریت خطا و بازگرداندن داده‌ها به حالت قبل (Graceful Rollback)
+    onError: (err, newFilePayload, context) => {
+      if (context?.previousFiles) {
+        this.queryClient.setQueryData(['files'], context.previousFiles);
+      }
+      console.error('Optimistic update rolled back due to error:', err);
+    },
+
+    // ۳. مرحله سوم: اعتبارسنجی مجدد داده‌ها پس از مشخص شدن تکلیف درخواست (Settled)
+    onSettled: () => {
+      // همگام‌سازی نهایی و مطمئن با دیتابیس اصلی سرور در پس‌زمینه
+      this.queryClient.invalidateQueries({ queryKey: ['files'] });
+    }
+  }));
+}
+
+
+// features/upload-file/ui/upload-zone.component.ts
+import { Component, inject } from '@angular/core';
+import { UploadFileMutationService } from '../model/upload-file-mutation.service';
+
+@Component({
+  selector: 'app-upload-zone',
+  standalone: true,
+  template: `
+    <div class="drop-zone" (click)="triggerUpload()">
+      <p>Click to upload your file</p>
+      
+      @if (uploadFileService.uploadMutation.isPending()) {
+        <div class="progress-bar-container">
+          <span>Uploading and Syncing in background...</span>
+        </div>
+      }
+    </div>
+  `
+})
+export class UploadZoneComponent {
+  public uploadFileService = inject(UploadFileMutationService);
+
+  public triggerUpload() {
+    const mockFile = new File(["file content"], "presentation.pptx", { type: "application/vnd.ms-powerpoint" });
+    const uniqueFileId = crypto.randomUUID();
+
+    // اجرای عملیات
+    this.uploadFileService.uploadMutation.mutate({
+      file: mockFile,
+      fileId: uniqueFileId
+    });
+  }
+}
 
 
 

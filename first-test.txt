@@ -1591,4 +1591,222 @@ export class UploadZoneComponent {
 
 
 
+----------
 
+خیلی خوب، دقیقاً به همان سبک مثال قبلی (C1 تا C4)، برای سیستم رزرواسیون بلیط هواپیما (مثل علی‌بابا یا اسنپ‌تریپ) طراحی می‌کنیم.
+چهار چالش اصلی شما را با مثال عینی در همین سناریو پیاده‌سازی می‌کنیم:
+
+Maintainability (قابلیت نگهداری و توسعه)
+
+Authentication (احراز هویت امن)
+
+State management (مدیریت وضعیت پیچیده ویزارد ۴ مرحله‌ای)
+
+Client observability (دیدن دقیق رفتار کاربر و خطاهای UI)
+
+✈️ سناریوی نمونه (Use Case)
+مسافر «سارا» می‌خواهد بلیط تهران → مشهد برای تاریخ ۵ تیر را رزرو کند.
+او وارد اپ می‌شود (Authentication)، پرواز را انتخاب می‌کند، صندلی دلخواه را برمی‌دارد، اطلاعات مسافران را پر می‌کند و وارد مرحله پرداخت می‌شود.
+ناگهان شبکه دچار قطعی می‌شود، اما وقتی برمی‌گردد، سیستم باید همان مرحله را به او نشان دهد (State management) و اجازه دهد پرداخت را دوباره امتحان کند، بدون اینکه صندلی‌اش از دست برود.
+
+🏗️ سطح C1 – System Context (دیدگاه کلی)
+مخاطب: مدیر محصول و هر فرد غیرفنی
+
+text
+┌─────────────────┐          ┌─────────────────────────────┐
+│   کاربر مسافر   │─────────▶│   سیستم رزرواسیون بلیط      │
+│  (مرورگر/اپ)    │          │  (Airline Reservation Sys)  │
+└─────────────────┘          └──────────────┬──────────────┘
+                                            │
+                                   ┌────────▼────────┐
+                                   │  درگاه پرداخت   │
+                                   │  (زرین‌پال/سامان)│
+                                   └─────────────────┘
+📌 چالش Authentication در این سطح:
+سیستم باید بداند «سارا» کیست و اجازه ندهد کسی بدون ورود، بلیط رزرو کند.
+
+🧱 سطح C2 – Container (معماری سرویس‌ها)
+مخاطب: معمار نرم‌افزار و تیم فنی
+
+text
+┌─────────────────────────────────────────────────────────────────┐
+│                     Frontend (React/Next.js)                   │
+│  - مدیریت ویزارد ۴ مرحله‌ای (جستجو→انتخاب→اطلاعات→پرداخت)   │
+│  - ذخیره وضعیت در SessionStorage برای بازیابی پس از رفرش     │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ (HTTPS + JWT)
+┌────────────────────────────▼────────────────────────────────────┐
+│                    API Gateway (Kong/Express)                  │
+│  - اعتبارسنجی JWT (Authentication)                            │
+│  - نرخ محدودیت (Rate Limiting)                                │
+└───────┬──────────────────────┬──────────────────────┬──────────┘
+        │                      │                      │
+┌───────▼──────┐     ┌────────▼────────┐    ┌───────▼──────┐
+│  Inventory   │     │   Booking       │    │   Payment    │
+│  Service     │     │   Service       │    │   Service    │
+│  (نگهداری   │     │  (مدیریت وضعیت  │    │  (پرداخت و   │
+│   صندلی‌ها)  │     │   رزرو و قفل)   │    │   امنیت)     │
+└───────┬──────┘     └────────┬────────┘    └───────┬──────┘
+        │                    │                     │
+┌───────▼────────────────────▼─────────────────────▼──────┐
+│         دیتابیس‌ها و کش (PostgreSQL + Redis)           │
+│  - Redis: نگهداری وضعیت موقت رزرو (TTL ۵ دقیقه‌ای)    │
+│  - PostgreSQL: ذخیره نهایی بلیط پس از پرداخت          │
+└─────────────────────────────────────────────────────────┘
+📌 چالش Maintainability در این سطح:
+سرویس‌ها بر اساس دامنه (Domain) جدا شده‌اند. اگر بخواهیم منطق قیمت‌گذاری را عوض کنیم، فقط Inventory Service را تغییر می‌دهیم و به Payment و Booking کاری نداریم. این یعنی توسعه‌پذیری بالا.
+
+📦 سطح C3 – Component (اجزای داخلی سرویس Booking)
+مخاطب: توسعه‌دهندگان ارشد و تحلیلگران سیستم
+
+بیایید Booking Service را باز کنیم تا ببینیم چالش‌های State management و Observability را چطور حل می‌کند:
+
+text
+┌─────────────────────────────────────────────────────────────────┐
+│                      Booking Service                          │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  WizardStateManager (مدیریت مرحله کاربر)              │  │
+│  │  - کلید در Redis: `booking:user:{userId}`             │  │
+│  │  - مقدار: { step: 3, flightId, seatNumber, ... }      │  │
+│  │  - هر تغییر مرحله، بلافاصله در Redis آپدیت می‌شود    │  │
+│  └───────────────────────┬─────────────────────────────────┘  │
+│                          │                                    │
+│  ┌───────────────────────▼─────────────────────────────────┐  │
+│  │  SeatLocker (قفل صندلی با TTL)                        │  │
+│  │  - هنگام انتخاب صندلی، کلید `seat:lock:{flightId}`   │  │
+│  │  - اگر کاربر پرداخت نکرد، بعد ۵ دقیقه قفل آزاد می‌شود│  │
+│  │  - جلوگیری از خرید همزمان یک صندلی توسط دو نفر       │  │
+│  └───────────────────────┬─────────────────────────────────┘  │
+│                          │                                    │
+│  ┌───────────────────────▼─────────────────────────────────┐  │
+│  │  ClientObserver (ارسال رویداد به تیم تحلیل)           │  │
+│  │  - هر خطای UI (مثلاً تایید نشدن کد تخفیف) را لاگ می‌کند│  │
+│  │  - زمان سپری شده در هر مرحله را اندازه‌گیری می‌کند    │  │
+│  │  - داده را به Kafka/ELK می‌فرستد برای داشبورد         │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+📌 چالش State management در این سطح:
+وضعیت در دو جا نگهداری می‌شود تا همیشه قابل بازیابی باشد:
+۱. سمت کلاینت (SessionStorage) برای نمایش سریع UI.
+۲. سمت سرور (Redis) برای امنیت و جلوگیری از تقلب (اگر کاربر کوکی را پاک کند، سرور همچنان وضعیت را دارد).
+
+🧬 سطح C4 – Code (نمونه کد عملی برای هر چالش)
+مخاطب: همه برنامه‌نویسان (بک‌اند و فرانت‌اند)
+
+۱. Authentication (احراز هویت)
+در Gateway (میدلور JWT):
+
+javascript
+// middleware/auth.js
+const jwt = require('jsonwebtoken');
+
+module.exports = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'ورود الزامی است' });
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.userId;
+    req.role = decoded.role; // 'user' یا 'admin'
+    next();
+  } catch {
+    res.status(403).json({ error: 'توکن نامعتبر' });
+  }
+};
+👆 اگر توکن منقضی شود، کلاینت درخواست Refresh Token می‌دهد و کاربر بدون نیاز به ورود مجدد، ادامه می‌دهد.
+
+۲. State Management (مدیریت وضعیت ویزارد در فرانت‌اند)
+استفاده از Zustand + SessionStorage:
+
+javascript
+// stores/bookingStore.js
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+const useBookingStore = create(
+  persist(
+    (set) => ({
+      step: 1,
+      flight: null,
+      seat: null,
+      passengers: [],
+      paymentId: null,
+
+      goToStep: (step) => set({ step }),
+      setFlight: (flight) => set({ flight, step: 2 }),
+      setSeat: (seat) => set({ seat, step: 3 }),
+      setPassengers: (passengers) => set({ passengers, step: 4 }),
+      
+      // بازیابی پس از قطعی اینترنت
+      reset: () => set({ step: 1, flight: null, seat: null, passengers: [] })
+    }),
+    {
+      name: 'booking-storage', // کلید در sessionStorage
+      getStorage: () => sessionStorage,
+    }
+  )
+);
+👆 اگر سارا مرورگر را ببندد و دوباره باز کند، دقیقاً همان مرحله آخر را می‌بیند (حتی اگر اینترنت قطع بوده باشد).
+
+۳. Maintainability (قابلیت نگهداری با معماری تمیز)
+استفاده از Repository Pattern برای تغییر راحت دیتابیس:
+
+python
+# repositories/seat_repository.py (کد Backend پایتون)
+from abc import ABC, abstractmethod
+
+class SeatRepository(ABC):
+    @abstractmethod
+    def lock_seat(self, flight_id, seat_num, user_id):
+        pass
+
+class RedisSeatRepository(SeatRepository):
+    def lock_seat(self, flight_id, seat_num, user_id):
+        key = f"seat:lock:{flight_id}:{seat_num}"
+        # اگر کلید وجود نداشت، با TTL=300 ثانیه ست کن
+        return redis_client.set(key, user_id, ex=300, nx=True)
+
+class PostgresSeatRepository(SeatRepository):
+    def lock_seat(self, flight_id, seat_num, user_id):
+        # اگر نیاز به لاک سنگین با دیتابیس رابطه‌ای داشتیم
+        # UPDATE seats SET locked_by=user_id WHERE flight_id=... AND locked_by IS NULL
+        pass
+
+# در سرویس اصلی، فقط کافی است نوع Repository را عوض کنیم:
+# اگر فردا خواستیم از PostgreSQL به جای Redis برویم، فقط اینجا را عوض می‌کنیم.
+repo = RedisSeatRepository() 
+👆 این یعنی تغییر در لایه دیتابیس، هیچ تأثیری روی منطق بیزینس (Business Logic) نمی‌گذارد => Maintainability بالا.
+
+۴. Client Observability (مشاهده‌پذیری رفتار کاربر)
+ارسال رویدادها از فرانت‌اند به بک‌اند (مثلاً به Kafka):
+
+javascript
+// utils/observer.js
+export const trackEvent = (eventName, metadata) => {
+  // حتی اگر اینترنت قطع باشد، در صف (Queue) ذخیره می‌کنیم
+  if (!navigator.onLine) {
+    localStorage.setItem('pending_events', JSON.stringify([...getPending(), { eventName, metadata, time: Date.now() }]));
+    return;
+  }
+
+  fetch('/api/analytics/track', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userId: getUserId(),
+      event: eventName,
+      page: 'booking-wizard',
+      step: useBookingStore.getState().step,
+      metadata,
+      timestamp: Date.now()
+    })
+  });
+};
+
+// استفاده در کامپوننت پرداخت:
+const handlePaymentError = (error) => {
+  trackEvent('payment_failure', { errorCode: error.code, amount: 750000 });
+  // این رویداد در داشبورد (مثلاً Kibana) نشان می‌دهد که چند درصد کاربران 
+  // در مرحله پرداخت خطا می‌خورند => Client Observability
+};
